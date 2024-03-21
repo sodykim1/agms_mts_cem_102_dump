@@ -1,0 +1,961 @@
+/**
+ * @file  app_cem102.c
+ * @brief CEM102 low power application initialization and operation file
+ *        source file
+ *
+ * @copyright @parblock
+ * Copyright (c) 2023 Semiconductor Components Industries, LLC (d/b/a
+ * onsemi), All Rights Reserved
+ *
+ * This code is the property of onsemi and may not be redistributed
+ * in any form without prior written permission from onsemi.
+ * The terms of use and warranty for this code are covered by contractual
+ * agreements between onsemi and the licensee.
+ *
+ * This is Reusable Code.
+ * @endparblock
+ */
+
+#include <hw.h>
+#include <app.h>
+#include "app_cem102.h"
+
+
+//============================================================================
+// PUBLIC FUNCTION DEFINITIONS
+//============================================================================
+#define LOG_FLOAT_MARKER "%c%d.%04d"
+
+#define MAX_WEO_LVL_MV			 40000.0f
+#define MIN_WEO_LVL_MV			-25000.0f
+
+#define fA_T0_nA			1000.0f
+
+#define DAC_HIGH_SETTING			1.44f				// 1500mV - 800mV = 700mV...640mV
+#define DAC_LOW_SETTING			0.46f				//   500mV - 800mV = -300mV...-340mV
+
+/**
+ * @brief Macro for dissecting a float number into two numbers (integer and residuum).
+ */
+#define LOG_FLOAT(val) (val > 0) ?' ':'-', \
+					   (int32_t)(val),     \
+                       (int32_t)(((val > 0) ? (val) - (int32_t)(val)       \
+                       : (int32_t)(val) - (val))*10000)
+
+
+
+/* Globals for Chicopee measurements */
+volatile MEASUREMENT_STATUS_FLAG measure_status;
+uint16_t measure_buf[MEASUREMENT_LENGTH];
+uint32_t calib_ref_measurement;
+
+/* GPIO IRQ detected */
+volatile uint32_t irq = 0;
+volatile uint8_t vdda_err_flag;
+
+volatile Calib_state_t calib_state;
+
+DRIVER_CEM102_t *cem102 = &Driver_CEM102;
+CEM102_TrimStruct trims;
+
+#ifdef STRIPPING_ENABLE
+#define TOGGLE_TIME_INTERVAL	  15		//  6sec * 5 = 30sec ==> 2min
+#define STRIPPING_TIME_OVER		120		// 1800sec(30min) => 60* 30 = 1800sec
+
+#define STRIPPING_LOW_STATE				0
+#define STRIPPING_HIGH_STATE				1
+
+uint16_t we_dac_setting = 0;
+
+volatile uint32_t stripping_update_time = 0;
+
+volatile uint32_t cel102_calibration_time = 0;
+volatile uint32_t cel102_operation_time = 0;
+volatile uint32_t cel102_interval_time = 0;
+
+volatile uint16_t ACCUM_SAMPLE_CNT = 1;
+volatile uint16_t stripping_toggle_timer=0 ;
+
+
+volatile uint16_t CH1_TIA_FB_RES =  CH1_TIA_FB_RES_500K;
+volatile uint16_t CH2_TIA_FB_RES =  CH2_TIA_FB_RES_500K;
+
+volatile uint8_t AGMS_NOTIFICATION =  0;
+
+int8_t stripping_state=STRIPPING_ACCUM_1 ;
+int8_t stripping_dac_set=STRIPPING_DAC_SET ;
+
+#endif
+
+const CEM102_Device cem102_dut_desc =
+{
+    /* Resources */
+    .spi        = 0,
+    .dma[0]     = 0,
+    .dma[1]     = 1,
+    .irq_index  = 1,
+
+    /* Pads */
+    .spi_clk    = CEM102_SPI_CLK_GPIO,
+    .spi_ctrl   = CEM102_SPI_CTRL_GPIO,
+    .spi_io0    = CEM102_SPI_IO0_GPIO,
+    .spi_io1    = CEM102_SPI_IO1_GPIO,
+    .clk        = -1,
+    .irq        = CEM102_IRQ_GPIO,
+    .pwr_en     = CEM102_NRESET_GPIO,
+    .pwr_cfg    = LOW_VOLTAGE,
+    .vdda_gpio  = CEM102_VDDA_DUT_GPIO,
+    .aout_gpio  = CEM102_AOUT_GPIO,
+    .io0        = -1,
+    .io0_type   = GPIO_MODE_INPUT,
+    .io1        = -1,
+    .io1_type   = GPIO_MODE_INPUT,
+
+    /* Interface configurations */
+    .gpio_cfg   = (GPIO_LPF_DISABLE | GPIO_WEAK_PULL_DOWN | GPIO_3X_DRIVE),
+    .spi_prescale = SPI_PRESCALE_8,
+
+    /* Call-back functions */
+    .spi_callback = &SPI_CallBack,
+    .gpio_callback = &GPIO_CallBack,
+};
+
+const CEM102_Device *cem102_dut = &cem102_dut_desc;
+
+/*	add sodykim for dac reference */
+typedef struct {
+	uint16_t we1;
+	uint16_t we2;
+	uint16_t ref;
+
+} afe_target_mv_t;
+
+afe_target_mv_t	afe_target_mv;
+
+
+void GPIO1_IRQHandler(void)
+{
+    irq = 1;
+}
+
+void DMA0_IRQHandler(void)
+{
+    cem102->TXHandler(cem102_dut);
+}
+
+void DMA1_IRQHandler(void)
+{
+    cem102->RXHandler(cem102_dut);
+}
+
+void GPIO_CallBack(uint32_t event)
+{
+
+}
+
+void SPI_CallBack(uint32_t event)
+{
+    /* If we were reading results, copy the SPI data to the measurement buffer
+     * and then mark them as ready for processing */
+    if (measure_status == MEASURE_READING_RESULTS)
+    {
+        cem102->RegisterBufferRead(cem102_dut, measure_buf, MEASUREMENT_LENGTH);
+        measure_status = MEASURE_RESULTS_READY;
+
+        if (calib_state == CALIB_REF_MEASURING)
+        {
+            calib_state = CALIB_REF_READING;
+        }
+        else if (calib_state == CALIB_CH1_MEASURING)
+        {
+            calib_state = CALIB_CH1_READING;
+        }
+        else if (calib_state == CALIB_CH2_MEASURING)
+        {
+            calib_state = CALIB_CH2_READING;
+        }
+    }
+}
+
+static int DAC_GetCalibratedSetting(CEM102_DAC_TYPE dac, uint16_t target_mv,
+                                    uint16_t *p_dac)
+{
+    int result = ERRNO_NO_ERROR;
+
+    if ((dac != WE1) && (dac != WE2) && (dac != RE))
+    {
+        /* Invalid channel selected */
+        result = ERRNO_PARAM_ERROR;
+    }
+    else
+    {
+        uint16_t dac_setting = 0;
+        result = cem102->CalculateDACAmplitude(cem102_dut, dac, target_mv,
+                                               &dac_setting);
+
+        /* OTP v3 parts will cause CalculateDACAmplitude to return error. */
+        if (result == ERRNO_GENERAL_FAILURE)
+        {
+            result = cem102->CalculateDACAmplitudeADC(cem102_dut, dac, target_mv,
+                                                      &dac_setting);
+        }
+
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("DAC-%d: CalculateDACAmplitude returns 0x%x\r\n", dac, dac_setting);
+#endif
+        *p_dac = dac_setting;
+    }
+    return result;
+}
+
+static int Config_SendIdleCommand(void)
+{
+    /* Ensure all errors and system status is cleared before starting the
+     * measurement.
+     */
+    uint16_t idle_cmd = DIGITAL_RESET_CLR_CMD | VDDA_ERR_CLR_CMD |
+                        DC_DAC_LOAD_CLR_CMD | CH1_COMPLETION_CLR_CMD |
+                        CH2_COMPLETION_CLR_CMD | BUFFER_RESET_CMD |
+                        IDLE_CMD;
+    return cem102->SystemCommand(cem102_dut, idle_cmd);
+}
+
+static int Config_ForMeasuring(CEM102_DAC_TYPE dac, uint16_t target_mv,
+                               uint32_t ref_measurement)
+{
+
+    int result = ERRNO_NO_ERROR;
+
+	CH1_TIA_FB_RES =  CH1_TIA_FB_RES_500K;
+	CH2_TIA_FB_RES =  CH2_TIA_FB_RES_500K;
+	ACCUM_SAMPLE_CNT = ACCUM_SAMPLE_CNT_1;
+
+    if (dac != WE1 && dac != WE2)
+    {
+        /* Invalid channel selected */
+        result = ERRNO_PARAM_ERROR;
+    }
+
+    result |= cem102->REDACConfig(cem102_dut, DAC_RE_DISABLE, 0,
+                                  (RE_BUF_DISABLE | RE_HP_MODE_DISABLE));
+
+    int index = dac - 1;
+    uint16_t dac_setting = 0;
+    if ((result == ERRNO_NO_ERROR) && (stripping_state!=STRIPPING_ACCUM_7))				// FIRST ....ACCUMULATION is 1
+    {
+        result = DAC_GetCalibratedSetting(dac, target_mv,
+                                          &dac_setting);
+    }
+
+#ifdef STRIPPING_ENABLE
+    if((dac==WE1)&&(stripping_state!=STRIPPING_ACCUM_7)) {
+    	we_dac_setting = dac_setting;
+    }
+#endif
+
+
+//----------------------------------------------------------------------------------------------------------------------------
+//	ADD for Stripping Data
+//----------------------------------------------------------------------------------------------------------------------------
+    if(stripping_state==STRIPPING_ACCUM_7) {
+    	CH1_TIA_FB_RES = CH1_TIA_FB_RES_8M;
+    	CH2_TIA_FB_RES = CH2_TIA_FB_RES_8M;
+
+    	swmLogInfo("stripping_state: STRIPPING_ACCUM_7\r\n");
+
+    }
+    else {
+    	swmLogInfo("stripping_state: STRIPPING_ACCUM_1\r\n");
+    }
+
+    uint16_t tia_en[2] = { CH1_TIA_ENABLE, CH2_TIA_ENABLE };
+    uint16_t tia_cfg[2] = { CH1_TIA_INT_FB_ENABLE | CH1_TIA_FB_RES,
+                            CH2_TIA_INT_FB_ENABLE | CH2_TIA_FB_RES
+                          };
+
+    result |= cem102->TIAConfig(cem102_dut, dac, tia_en[index], tia_cfg[index]);
+
+    /* Configure the CEM102 device for a basic measurement */
+    uint16_t dac_mask[2] = { DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK,
+                             DC_DAC_WE2_CTRL_DAC_WE2_VALUE_MASK
+                           };
+    uint16_t dac_en[2] = { DAC_WE1_ENABLE, DAC_WE2_ENABLE };
+
+    result |= cem102->WEDACConfig(cem102_dut, dac,
+                                  ((dac_mask[index] & dac_setting) |
+                                  dac_en[index]), DC_DAC_LOAD_IRQ_DISABLE);
+
+    uint16_t chan_cfg[2] = { CH1_BUF_IB0 | CH1_LPF_BW_CFG_DISABLE,
+                             CH2_BUF_IB0 | CH2_LPF_BW_CFG_DISABLE
+                           };
+    uint16_t buf_cfg[2] = { CH1_BUF_ENABLE | CH1_BUF_BYPASS_DISABLE,
+                            CH2_BUF_ENABLE | CH2_BUF_BYPASS_DISABLE
+                          };
+    result |= cem102->BufferConfig(cem102_dut, dac, chan_cfg[index],
+                                   buf_cfg[index]);
+
+    uint16_t conn_cfg[2] = { CH1_SC119_SC120_CONNECT | CH1_SC112_CONNECT,
+                             CH2_SC219_SC220_CONNECT | CH2_SC212_CONNECT
+                           };
+    result |= cem102->SwitchConfig(cem102_dut, dac, conn_cfg[index]);
+
+    result |= cem102->ClockConfig(cem102_dut, LSAD_PRESCALE2,
+                                  LSAD_START_DELAY_50MS);
+
+    uint16_t lsad_cfg[2] = { LSAD1_GAIN_UNITY | LSAD1_SYS_CHOP_ENABLE |
+                             LSAD1_ORSD8192_RSD8 |  LSAD1_ITRIM_1p00 |
+                             LSAD1_BUF_CHOP_CLK_DIV8192 |
+                             LSAD1_ADC_CHOP_CLK_DIV16,
+                             LSAD2_GAIN_UNITY | LSAD2_SYS_CHOP_ENABLE |
+                             LSAD2_ORSD8192_RSD8 | LSAD2_ITRIM_1p00 |
+                             LSAD2_BUF_CHOP_CLK_DIV8192 |
+                             LSAD2_ADC_CHOP_CLK_DIV16
+                           };
+    uint16_t thresh_cfg[2] = { CH1_VIOLATION_CHECK_DISABLE,
+                               CH2_VIOLATION_CHECK_DISABLE
+                             };
+    uint16_t buff_cfg[2] = { CH1_DOUBLE | CH1_VIOLATION_ABS_DISABLE,
+                             CH2_DOUBLE | CH2_VIOLATION_ABS_DISABLE
+                           };
+
+/* after stripping ...AUUCUMATION COUNT is 8*/
+    if(stripping_state==STRIPPING_ACCUM_7) {
+    	ACCUM_SAMPLE_CNT = ACCUM_SAMPLE_CNT_8;
+    }
+
+    uint16_t accum_cfg[2] = { (CHCFG_CH1_ACCUM_CH1_ACCUM_SAMPLE_CNT_MASK &
+    								ACCUM_SAMPLE_CNT) | CH1_MEASUREMENT_ENABLE,
+                              	  (CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK &
+                            		 ACCUM_SAMPLE_CNT) | CH2_MEASUREMENT_ENABLE
+                            };
+    result |= cem102->ADCConfig(cem102_dut, dac, lsad_cfg[index],
+                                thresh_cfg[index], buff_cfg[index],
+                                accum_cfg[index]);
+
+    result |= Config_SendIdleCommand();
+    Sys_Delay(APP_SYS_DELAY_20MS);
+
+    return result;
+}
+
+static int Config_PostMeasurement(CEM102_DAC_TYPE dac)
+{
+    int result = ERRNO_NO_ERROR;
+
+    if (dac != WE1 && dac != WE2)
+    {
+        /* Invalid channel selected */
+        result = ERRNO_PARAM_ERROR;
+    }
+
+    /* Re-configure internal switches to connect the ADC to the channel. */
+    int index = dac - 1;
+    uint16_t sw_cfg[2] = { CH1_SC119_SC120_CONNECT | CH1_SC112_CONNECT,
+                           CH1_SC119_SC120_CONNECT | CH1_SC112_CONNECT,
+                         };
+    result |= cem102->SwitchConfig(cem102_dut, dac, sw_cfg[index]);
+
+    /* Restore ANA_CFG2 configuration */
+    uint16_t ana_cfg2 = 0;
+    result |= cem102->RegisterRead(cem102_dut, ANA_CFG2, &ana_cfg2);
+    result |= cem102->RegisterWrite(cem102_dut, ANA_CFG2,
+                                    SENSOR_CAL_DISABLE | ana_cfg2);
+
+    result |= Config_SendIdleCommand();
+    Sys_Delay(APP_SYS_DELAY_20MS);
+
+    return result;
+}
+
+int CEM102_Calibrate(DRIVER_CEM102_t * cem102)
+{
+    uint32_t cal_measurement = 0;
+    uint16_t status = 0;
+    int result = 0;
+//    uint16_t target_mv = WE_DAC_TARGET_MV;
+    static uint16_t dac_setting_re = 0;
+
+    afe_target_mv.we1 = WE1_DAC_TARGET_MV;
+    afe_target_mv.we2 = WE2_DAC_TARGET_MV;
+    afe_target_mv.ref = REF_DAC_TARGET_MV;
+
+    if (calib_state == CALIB_INITIALIZED)
+    {
+
+        if (cem102_dut->pwr_cfg == LOW_VOLTAGE)
+        {
+            /* Read the current VCC Trim */
+            uint32_t vcc_trim = (ACS->VCC_CTRL & ACS_VCC_CTRL_VTRIM_Mask);
+
+            /* Discharge VDDA down to its trimmed value of 2.3 */
+            cem102->VDDADischarge(cem102_dut, VDDA_DISCHARGE_TIME_MS);
+
+            /* Calibrate VCC to 1250 mV */
+            cem102->CalibrateVCC(cem102_dut, vcc_trim, VCC_TYPICAL);
+        }
+
+        /* Enable the VBAT VDDA monitor after VCC is calibrated */
+        cem102->VBAT_VDDAMonitorStart(cem102_dut, WE1,
+                                      SENSOR_THRESHOLD_MIN_THRESHOLD_MIN);
+
+        cem102->MeasureReference(cem102_dut, WE1);
+        measure_status = MEASURE_MEASURING;
+        calib_state = CALIB_REF_MEASURING;
+    }
+    else if (calib_state == CALIB_REF_MEASURING)
+    {
+        result = cem102->RegisterRead(cem102_dut, SYS_STATUS, &status);
+
+        /* If CH1 measurement has completed, queue it for reading */
+        if ((status & CH1_COMPLETION) != 0)
+        {
+            measure_status = MEASURE_READING_RESULTS;
+            cem102->QueueRead(cem102_dut, SYS_BUFFER_WORD0, APP_REFERENCE_LENGTH);
+        }
+    }
+    else if (calib_state == CALIB_REF_READING)
+    {
+        /* Save the reference measurement */
+        calib_ref_measurement = measure_buf[APP_WE1_LOWER_HALF_WORD] +
+                               (measure_buf[APP_WE1_UPPER_HALF_WORD] << 16);
+
+        if (result == ERRNO_NO_ERROR)
+        {
+            result = DAC_GetCalibratedSetting(RE, afe_target_mv.ref, &dac_setting_re);
+        }
+        result |= Config_ForMeasuring(WE1, afe_target_mv.we1, calib_ref_measurement);
+
+        /* Now that we have our channel configuration, take a calibration
+         * measurement
+         */
+        cem102->CalibrateChannel(cem102_dut, WE1);
+        measure_status = MEASURE_MEASURING;
+        calib_state = CALIB_CH1_MEASURING;
+    }
+    else if (calib_state == CALIB_CH1_MEASURING)
+    {
+        result = cem102->RegisterRead(cem102_dut, SYS_STATUS, &status);
+
+        if ((status & CH1_COMPLETION) != 0)
+        {
+            /* After the measurement is finished, queue a read of the
+             * measurement data
+             */
+            measure_status = MEASURE_READING_RESULTS;
+            cem102->QueueRead(cem102_dut, SYS_BUFFER_WORD0, MEASUREMENT_LENGTH);
+        }
+    }
+    else if (calib_state == CALIB_CH1_READING)
+    {
+        cal_measurement = measure_buf[APP_WE1_LOWER_HALF_WORD] +
+                         (measure_buf[APP_WE1_UPPER_HALF_WORD] << 16);
+
+        cem102->CalculateChannelGain(cem102_dut, WE1, calib_ref_measurement,
+                                     cal_measurement);
+
+        if(stripping_state==STRIPPING_ACCUM_7) {
+
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("ChannelGain_1(ACCUM7): 0x%X, 0x%X, 0x%X\r\n",
+                   (int32_t)channel_gain[2], calib_ref_measurement,
+                   cal_measurement);
+#endif /* SWMTRACE_OUTPUT */
+        	 result |= Config_PostMeasurement(WE1);
+
+        	Config_SendIdleCommand();					// add for jerry
+        	stripping_state = STRIPPING_ACCUM_1;
+
+        	 result |= Config_ForMeasuring(WE2, afe_target_mv.we2, calib_ref_measurement);
+
+ 			cem102->CalibrateChannel(cem102_dut, WE2);
+ 			measure_status = MEASURE_MEASURING;
+ 			calib_state = CALIB_CH2_MEASURING;
+
+        }
+        else {
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("ChannelGain_1(ACCUM1): 0x%X, 0x%X, 0x%X\r\n",
+                   (int32_t)channel_gain[0], calib_ref_measurement,
+                   cal_measurement);
+#endif /* SWMTRACE_OUTPUT */        	
+        	
+        	 Config_SendIdleCommand();					// add for jerry
+        	 stripping_state = STRIPPING_ACCUM_7;
+
+#if 1
+        	 result |= Config_ForMeasuring(WE1, afe_target_mv.we1, calib_ref_measurement);
+#else
+			result |= Config_PostMeasurement(WE1);
+			result |= Config_ForMeasuring(WE2, afe_target_mv.we2, calib_ref_measurement);
+#endif
+			/* Now that we have our channel configuration, take a calibration
+			 * measurement
+			 */
+#if 0
+			cem102->CalibrateChannel(cem102_dut, WE2);
+			measure_status = MEASURE_MEASURING;
+			calib_state = CALIB_CH2_MEASURING;
+#else
+			cem102->CalibrateChannel(cem102_dut, WE1);
+
+	        measure_status = MEASURE_MEASURING;
+	        calib_state = CALIB_CH1_MEASURING;
+#endif
+        }
+    }
+    else if (calib_state == CALIB_CH2_MEASURING)
+    {
+        result = cem102->RegisterRead(cem102_dut, SYS_STATUS, &status);
+
+        if ((status & CH2_COMPLETION) != 0)
+        {
+            /* After the measurement is finished, queue a read of the
+             * measurement data
+             */
+            measure_status = MEASURE_READING_RESULTS;
+            cem102->QueueRead(cem102_dut, SYS_BUFFER_WORD0, MEASUREMENT_LENGTH);
+        }
+    }
+    else if (calib_state == CALIB_CH2_READING)
+    {
+        cal_measurement = measure_buf[APP_WE2_LOWER_HALF_WORD] +
+                         (measure_buf[APP_WE2_UPPER_HALF_WORD] << 16);
+
+        cem102->CalculateChannelGain(cem102_dut, WE2, calib_ref_measurement,
+                                     cal_measurement);
+
+#if 1
+
+
+        if (stripping_state == STRIPPING_ACCUM_7)
+        {
+
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("ChannelGain_2(ACCUM7): 0x%X, 0x%X, 0x%X\r\n",
+                   (int32_t)channel_gain[3], calib_ref_measurement,
+                   cal_measurement);
+#endif /* SWMTRACE_OUTPUT */
+
+        result |= Config_PostMeasurement(WE2);
+
+//===========================================================================================================================================
+//	all gain measure  is completed...stripping start....accumulation is 1 and TIA FB RES is 0.5M ohm
+//===========================================================================================================================================
+		Config_SendIdleCommand();
+
+		cem102->RegisterWrite(cem102_dut,	CHCFG_CH1_ACCUM,	(CHCFG_CH1_ACCUM_CH1_ACCUM_SAMPLE_CNT_MASK & ACCUM_SAMPLE_CNT_1) | CH1_MEASUREMENT_ENABLE);
+		cem102->RegisterWrite(cem102_dut,	CHCFG_CH2_ACCUM, (CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK & ACCUM_SAMPLE_CNT_1) | CH2_MEASUREMENT_ENABLE);
+
+	     cem102->TIAConfig(cem102_dut, WE1, CH1_TIA_ENABLE, CH1_TIA_INT_FB_ENABLE | CH1_TIA_FB_RES_500K);
+	     cem102->TIAConfig(cem102_dut, WE2, CH2_TIA_ENABLE, CH2_TIA_INT_FB_ENABLE | CH2_TIA_FB_RES_500K);
+
+		 cem102->StartMeasurement(cem102_dut, CONTINOUS_CMD);
+
+		stripping_state = STRIPPING_ACCUM_1;
+//===========================================================================================================================================
+
+
+        calib_state = CALIB_DONE;
+        measure_status = MEASURE_INITIALIZED;
+
+
+        /* RE channel enable */
+        result |= cem102->REDACConfig(cem102_dut, ((DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK &
+                                      dac_setting_re) | DAC_RE_ENABLE),
+                                      (RE_SR1_DISCONNECT),
+                                      (RE_BUF_ENABLE | RE_HP_MODE_DISABLE));
+        }
+        else
+        {
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("ChannelGain_2(ACCUM1): 0x%X, 0x%X, 0x%X\r\n",
+                   (int32_t)channel_gain[1], calib_ref_measurement,
+                   cal_measurement);
+#endif /* SWMTRACE_OUTPUT */
+
+			Config_SendIdleCommand();
+
+			stripping_state = STRIPPING_ACCUM_7;
+
+			result |= Config_ForMeasuring(WE2, WE2_DAC_TARGET_MV, calib_ref_measurement);
+
+			/* Now that we have our channel configuration, take a calibration
+			 * measurement
+			 */
+			cem102->CalibrateChannel(cem102_dut, WE2);
+
+
+
+			measure_status = MEASURE_MEASURING;
+			calib_state = CALIB_CH2_MEASURING;
+        }
+
+#else
+
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("ChannelGain_2: 0x%X, 0x%X, 0x%X\r\n",
+                   (int32_t)channel_gain[1], calib_ref_measurement,
+                   cal_measurement);
+#endif /* SWMTRACE_OUTPUT */
+
+        result |= Config_PostMeasurement(WE2);
+
+        calib_state = CALIB_DONE;
+        measure_status = MEASURE_INITIALIZED;
+
+        /* RE channel enable */
+        result |= cem102->REDACConfig(cem102_dut, ((DC_DAC_RE_CTRL_DAC_RE_VALUE_MASK &
+                                      dac_setting_re) | DAC_RE_ENABLE),
+                                      (RE_SR1_DISCONNECT),
+                                      (RE_BUF_ENABLE | RE_HP_MODE_DISABLE));
+#endif
+    }
+    return result;
+}
+
+void CEM102_Startup(DRIVER_CEM102_t * cem102)
+{
+    /* Local variable definitions */
+    int result;
+
+#ifdef SWMTRACE_OUTPUT
+    uint16_t temp1, temp2;
+#endif
+
+    if (cem102_dut->pwr_cfg == LOW_VOLTAGE)
+    {
+        SYS_WATCHDOG_REFRESH();
+        while (!(CEM102_VCC_OK(trim_error, CEM102_VCC_OK_THRESH, &cem102_vbat)));
+
+        /* Multiply by 2 to get an approximate RSL15 VDDA value,
+         * when CEM102 VBAT is connected to RSL15 VDDA */
+        cem102_vbat = cem102_vbat * 2;
+    }
+    else
+    {
+        SYS_WATCHDOG_REFRESH();
+        while (!(CEM102_VBAT_OK(trim_error, CEM102_VBAT_OK_THRESH,
+                                &cem102_vbat)));
+    }
+
+    /* Initialize the CEM102 device */
+    cem102->Initialize(cem102_dut);
+    cem102->VDDCCharge(cem102_dut);
+    cem102->PowerReset(cem102_dut);
+    cem102->PowerInit(cem102_dut);
+
+    uint16_t temp = 0;
+
+    cem102->RegisterRead(cem102_dut, SYS_STATUS, &temp);
+    while (temp & VDDA_ERR)
+    {
+        SYS_WATCHDOG_REFRESH();
+        cem102->RegisterWrite(cem102_dut, SYSCTRL_CMD, VDDA_ERR_CLR_CMD);
+        cem102->RegisterRead(cem102_dut, SYS_STATUS, &temp);
+    }
+
+#ifdef SWMTRACE_OUTPUT
+    /* Read the chip family information */
+    result = cem102->RegisterRead(cem102_dut, CHIP_FAMILY_VERSION, &temp1);
+    if (result == ERRNO_NO_ERROR)
+    {
+        result = cem102->RegisterRead(cem102_dut, CHIP_REVISION, &temp2);
+        swmLogInfo("- Chip Revision: %X (%X)\r\n", temp1, temp2);
+    }
+    else
+    {
+        swmLogInfo("- Failed to read chip revision");
+    }
+#endif /* SWMTRACE_OUTPUT */
+
+    result = cem102->OTPRead(cem102_dut, &trims, INTERNAL_RC_CLK_FREQUENCY,
+                             OTP_READ_MAX_ATTEMPTS);
+
+    if (result == ERRNO_NO_ERROR)
+    {
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("- OTP Read Successful");
+#endif
+    }
+    else if (result == ERRNO_ECC_CORRECTED)
+    {
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("- OTP Read Corrected");
+#endif
+    }
+    else
+    {
+#ifdef SWMTRACE_OUTPUT
+        /* As the OTP data is unavailable, load the default trim settings */
+        swmLogInfo("- OTP Read Unsuccessful");
+#endif
+        trims.trim[0] = APP_BANDGAP_VREF_TRIM_DEFAULT;
+        trims.trim[1] = APP_VDD_TRIM_DEFAULT;
+    }
+
+    result |= cem102->DeviceTrim(cem102_dut, &trims);
+
+    if (result == ERRNO_NO_ERROR)
+    {
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("Measurement has been configured; enabling calibration.\r\n");
+#endif /* SWMTRACE_OUTPUT */
+
+        /* Enable CH1 Completion IRQ */
+        result |= cem102->RegisterWrite(cem102_dut, SYSCTRL_IRQ_CFG,
+                                        (CH1_COMPLETION_IRQ_ENABLE |
+                                          CH2_COMPLETION_IRQ_ENABLE |
+                                        STATE_ERR_IRQ_ENABLE));
+
+        /* Start calibration */
+        calib_state = CALIB_INITIALIZED;
+        measure_status = MEASURE_INITIALIZED;
+
+        stripping_state = STRIPPING_ACCUM_1;				// add Jerry
+
+        result |= CEM102_Calibrate(cem102);
+    }
+    else
+    {
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo("Errors occurred while configuring the measurement.\r\n");
+#endif /* SWMTRACE_OUTPUT */
+        measure_status = MEASURE_IDLE;
+    }
+}
+
+void CEM102_Operation(DRIVER_CEM102_t * cem102)
+{
+    uint16_t cem102_status = 0;
+
+    double weo1_lvl_mV=0;
+    double weo2_lvl_mV=0;
+
+
+    /* If the system has just completed initialization, start the first
+     * measurement
+     */
+    if (measure_status == MEASURE_INITIALIZED)
+    {
+        irq = 0;
+        cem102->StartMeasurement(cem102_dut, CONTINOUS_CMD);
+        measure_status = MEASURE_MEASURING;
+    }
+    else
+    {
+#if 0
+        /* If a CEM102 IRQ occurred, read the CEM102 status */
+        if (irq || ((ACS->WAKEUP_STATE & ACS_WAKEUP_STATE_WAKEUP_SRC_Mask)
+                == (CEM102_IRQ_GPIO << ACS_WAKEUP_STATE_WAKEUP_SRC_Pos)))
+#else
+        if(irq)
+#endif
+        {
+            irq = 0;
+            cem102->RegisterRead(cem102_dut, SYS_STATUS, &cem102_status);
+        }
+
+        if ((cem102_status & (0x1 << SYS_STATUS_STATE_ERR_STATUS_POS)) == STATE_ERR)
+        {
+            /* State Error occurred, re-initialize the CEM102. */
+            CEM102_Startup(cem102);
+        }
+        else if ((cem102_status & (0x1 << SYS_STATUS_VDDA_ERR_STATUS_POS)) == VDDA_ERR)
+        {
+            vdda_err_flag = 1;
+
+            /* Send VDDA_ERR alarm code to the central */
+            cem102_vbat = VDDA_ERR_ALARM;
+
+            CUSTOMSS_Notify_CEM102Bat_Now();
+
+            /* Wait for 10 seconds before going to Deep Sleep. During this period,
+             * executes BLE process so that notification can be sent */
+            uint32_t delay = ACS->RTC_COUNT;
+            delay += CONVERT_MS_TO_32K_CYCLES(RTC_SLEEP_TIME_S(VDDA_ERR_DEEP_SLEEP_DELAY));
+
+            while (delay > ACS->RTC_COUNT)
+            {
+                BLE_Kernel_Process();
+                __WFI();
+            }
+
+            /* Go to No Retention Sleep */
+            Switch_NoRetSleep_Mode();
+        }
+        else
+        {
+            /* Check if measurements are ready, and we are not actively
+             * reading those results
+             */
+            if (((cem102_status & CH1_COMPLETION) == CH1_COMPLETION) &&
+                ((cem102_status & CH2_COMPLETION) == CH2_COMPLETION) &&
+                ((measure_status != MEASURE_READING_RESULTS) &&
+                (measure_status != MEASURE_RESULTS_READY)))
+            {
+                measure_status = MEASURE_READING_RESULTS;
+                cem102->QueueRead(cem102_dut, SYS_BUFFER_WORD0, MEASUREMENT_LENGTH);
+            }
+
+            /* Make sure the device is idle before reading data or starting a
+             * new measurement
+             */
+            if (((cem102_status & SYS_STATUS_SYS_STATE_MASK) == CONTINOUS_STATE) &&
+                (measure_status == MEASURE_RESULTS_READY))
+            {
+                SYS_WATCHDOG_REFRESH();
+
+                cem102->CalculateCurrent(WE1, (int32_t)(measure_buf[APP_WE1_LOWER_HALF_WORD] +
+                                         (measure_buf[APP_WE1_UPPER_HALF_WORD] << 16)),
+                                         &WE1_current);
+                cem102->CalculateCurrent(WE2, (int32_t)(measure_buf[APP_WE2_LOWER_HALF_WORD] +
+                                         (measure_buf[APP_WE2_UPPER_HALF_WORD] << 16)),
+                                         &WE2_current);
+
+                if (vdda_err_flag == 0)
+                {
+                    /* Calculate CEM102 VBAT using SAR ADC */
+                    cem102->CalculateVBAT(&cem102_vbat);
+                }
+
+/********************************************************************************************************************************************************************
+ * 		CHANGE UXN PROTOCOL FORMAT...(nA -> WEO & WEP)	(fA)FEMTO -> (nA)NANO
+ ********************************************************************************************************************************************************************/
+#if 1							// RESOLUTION 0.01
+                weo1_lvl_mV = (double)WE1_current/10000.0f;
+				weo2_lvl_mV = (double)WE2_current/10000.0f;
+#else							// RESOLUTION 0.1
+                weo1_lvl_mV = (double)WE1_current/100000.0f;
+				weo2_lvl_mV = (double)WE2_current/100000.0f;
+#endif
+
+				if(weo1_lvl_mV >= MAX_WEO_LVL_MV)	weo1_lvl_mV = MAX_WEO_LVL_MV;
+				if(weo1_lvl_mV <= MIN_WEO_LVL_MV)	weo1_lvl_mV = MIN_WEO_LVL_MV;
+				if(weo2_lvl_mV >= MAX_WEO_LVL_MV)	weo2_lvl_mV = MAX_WEO_LVL_MV;
+				if(weo2_lvl_mV <= MIN_WEO_LVL_MV)	weo2_lvl_mV = MIN_WEO_LVL_MV;
+
+				afe_102->weo1_lvl_mV = (int16_t)weo1_lvl_mV+DAC_TARGET_BASE_MV;			// -32767~32768 ==> -327.67 ~ +327.68 nA
+				afe_102->weo2_lvl_mV = (int16_t)weo2_lvl_mV+DAC_TARGET_BASE_MV;
+
+				afe_102->wep1_lvl_mV = DAC_TARGET_BASE_MV;
+				afe_102->wep2_lvl_mV = DAC_TARGET_BASE_MV;
+
+
+				afe_102->vbat_lvl_mV = cem102_vbat;
+				afe_102->measure_update = API_TRUE;
+
+				afe_102->stripping_update = API_TRUE;
+
+/********************************************************************************************************************************************************************/
+
+#ifdef SWMTRACE_OUTPUT
+					swmLogInfo("WEO1 %d fA("LOG_FLOAT_MARKER"), WEO2 %d fA ("LOG_FLOAT_MARKER"),  measure time : %d \r\n",
+							WE1_current, LOG_FLOAT(weo1_lvl_mV), WE2_current,LOG_FLOAT(weo2_lvl_mV), Sys_RTC_Value_Seconds()-cel102_operation_time
+							);
+
+					cel102_operation_time = Sys_RTC_Value_Seconds();
+
+	#endif /* SWMTRACE_OUTPUT */
+
+                /* Clear Channel 1 & 2 completion status */
+                cem102->SystemCommand(cem102_dut, CH1_COMPLETION_CLR_CMD |
+                                      CH2_COMPLETION_CLR_CMD |CONTINOUS_CMD);
+
+                measure_status = MEASURE_MEASURING;
+            }
+        }
+    }
+}
+
+
+/***************************************************************************************************************************************************************************
+ *		-0.2v~0.8v stripping functiom..RE 800mV  ==>
+ *		stripping_update time is 16.66...WE1 8.33 WE2 8.33 ==> 16.66sec event
+ ***************************************************************************************************************************************************************************/
+void CEM102_Stripping(DRIVER_CEM102_t * cem102)
+{
+    uint16_t dac_setting = 0;
+   uint32_t stripping_time = 0;
+   uint32_t stripping_time_interval = 0;
+
+
+	stripping_time = Sys_RTC_Value_Seconds();
+	stripping_time_interval = (stripping_time-stripping_update_time);
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------
+//	STRIPPING INTERVAl TIME
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------
+	if((afe_102->stripping_update)&&(stripping_time_interval>=TOGGLE_TIME_INTERVAL))
+	{					// 15sec interval
+		afe_102->stripping_update=0;
+		stripping_update_time = stripping_time;
+
+		if(get_agms_conidx()!=0xFF) {
+			CUSTOMSS_Notify_CEM102_Update();
+		}
+
+/*****************************************************************************************************************************************
+  * 	30min(1800sec over) and high potential command stop...start low potential state
+  * 	Low: 0, 2, 4, 6, 8...High:1,3,5,7,9...
+  *****************************************************************************************************************************************/
+		if(afe_102->stripping_status != STRIPPING_STOP)
+		{
+    		if(afe_102->stripping_tmout>STRIPPING_TIME_OVER)
+    		{
+				afe_102->stripping_status = STRIPPING_STOP;
+				dac_setting = we_dac_setting;															// V =(2.3/4096)*(1781)  ==> 1.000v
+
+#ifdef SWMTRACE_OUTPUT
+				swmLogInfo("STRIPPING_STOP : [%d][%d][%d[%d]!!\r\n", afe_102->stripping_dump, we_dac_setting, dac_setting, stripping_time_interval);
+#endif
+				Config_SendIdleCommand();
+
+				cem102->WEDACConfig(cem102_dut, WE1,
+															((DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK & dac_setting) |  DAC_WE1_ENABLE),
+															DC_DAC_LOAD_IRQ_DISABLE);
+
+				cem102->RegisterWrite(cem102_dut,
+										CHCFG_CH1_ACCUM,
+										(CHCFG_CH1_ACCUM_CH1_ACCUM_SAMPLE_CNT_MASK & ACCUM_SAMPLE_CNT_8) | CH1_MEASUREMENT_ENABLE);
+
+				cem102->RegisterWrite(cem102_dut,
+										CHCFG_CH2_ACCUM,
+										(CHCFG_CH2_ACCUM_CH2_ACCUM_SAMPLE_CNT_MASK & ACCUM_SAMPLE_CNT_8) | CH2_MEASUREMENT_ENABLE);
+
+			     cem102->TIAConfig(cem102_dut, WE1,
+			    		 	 	 	 	CH1_TIA_ENABLE, CH1_TIA_INT_FB_ENABLE | CH1_TIA_FB_RES_8M);
+
+			     cem102->TIAConfig(cem102_dut, WE2,
+			    		 	 	 	 	 CH2_TIA_ENABLE, CH2_TIA_INT_FB_ENABLE | CH2_TIA_FB_RES_8M);
+
+			     stripping_state=STRIPPING_ACCUM_7;
+
+				 cem102->StartMeasurement(cem102_dut, CONTINOUS_CMD);
+
+    		}
+
+    		else
+    		{
+    				afe_102->stripping_tmout++;																										// 30sec increment...30sec * 60 = 180sec timeout
+
+					if(afe_102->stripping_dump == STRIPPING_LOW_STATE)
+							dac_setting = (uint16_t)((float)we_dac_setting*DAC_LOW_SETTING);									// 500mV - 800mV = -300mV
+					else
+							dac_setting = (uint16_t)((float)we_dac_setting*DAC_HIGH_SETTING);								// 1500mV - 800mV = 700mV
+
+					Config_SendIdleCommand();
+					cem102->WEDACConfig(cem102_dut, WE1,
+															((DC_DAC_WE1_CTRL_DAC_WE1_VALUE_MASK & dac_setting) |  DAC_WE1_ENABLE),
+															DC_DAC_LOAD_IRQ_DISABLE);
+
+					 cem102->StartMeasurement(cem102_dut, CONTINOUS_CMD);
+					afe_102->stripping_dump = ((afe_102->stripping_dump==STRIPPING_LOW_STATE) ? STRIPPING_HIGH_STATE:STRIPPING_LOW_STATE);
+
+#ifdef SWMTRACE_OUTPUT
+					swmLogInfo("STRIPPING_INTERVAL TIME : [%d]sec, dac_setting : [%X]\r\n", Sys_RTC_Value_Seconds()-cel102_interval_time, dac_setting);
+					cel102_interval_time = Sys_RTC_Value_Seconds();
+#endif
+    		}
+    	}
+    }
+}

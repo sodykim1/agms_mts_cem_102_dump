@@ -1,0 +1,433 @@
+/**
+ * @file  app_customss.c
+ * @brief Application-specific Bluetooth custom service server source file
+ *
+ * @copyright @parblock
+ * Copyright (c) 2023 Semiconductor Components Industries, LLC (d/b/a
+ * onsemi), All Rights Reserved
+ *
+ * This code is the property of onsemi and may not be redistributed
+ * in any form without prior written permission from onsemi.
+ * The terms of use and warranty for this code are covered by contractual
+ * agreements between onsemi and the licensee.
+ *
+ * This is Reusable Code.
+ * @endparblock
+ */
+
+#include <ble_abstraction.h>
+#include <string.h>
+#include <swmTrace_api.h>
+#include <app_customss.h>
+#include <stdio.h>
+#include <app.h>
+
+/* Application headers */
+#include "app_temperature_sensor.h"
+#include "app_agms.h"
+
+/* Global variable definition */
+volatile uint16_t cem102_vbat = 0;
+volatile int32_t WE1_current = 0;
+volatile int32_t WE2_current = 0;
+
+static struct app_env_tag_cs app_env_cs;
+
+static uint8_t conidx_saved=0xff;
+
+volatile uint32_t agme_update_time = 0;
+static uint8_t agms_base_info = BASE_INFO_RESPONSE;
+
+
+
+static const struct att_db_desc att_db_cs_svc0[] =
+{
+    /* WE  2 and RE characteristics will be updated in 1.1 */
+
+    /**** Service 0 ****/
+    CS_SERVICE_UUID_128(CS_SERVICE0, CS_SVC_UUID),
+
+
+    /**** To the Bluetooth transfer ****/
+    CS_CHAR_UUID_128(	CS_RX_VALUE_CHAR0,
+		CS_RX_VALUE_VAL0,
+        CS_CHAR_RX_UUID,
+		(PERM(RD, ENABLE) | PERM(NTF, ENABLE)),
+        sizeof(agms_payload_buff),
+		agms_payload_buff,
+        NULL
+    ),
+
+    CS_CHAR_CCC(	CS_RX_VALUE_CCC0,
+		app_env_cs.to_air_cccd_value,
+		NULL
+    ),
+
+    CS_CHAR_USER_DESC(	CS_RX_VALUE_USR_DSCP0,
+		sizeof(CS_CHAR_RX_NAME) - 1,
+		CS_CHAR_RX_NAME,
+		NULL
+    ),
+
+    /* Add IDs, permissions, data buffer, & callback to database */
+    CS_CHAR_UUID_128(	CS_TX_VALUE_CHAR0,                  	/* Characteristic's ID (attidx_char) */
+		CS_TX_VALUE_VAL0,                   										/* Characteristic's Value ID (attidx_val) */
+        CS_CHAR_TX_UUID,                        									/* Characteristic's UUID */
+        CS_TX_PERMISSIONS,                      									/* Characteristic's Permissions */
+        sizeof(app_env_cs.from_air_buffer),   							/* Characteristic's Data Length */
+		app_env_cs.from_air_buffer,           									/* Pointer to Characteristic's Data */
+        App_BLE_CUSSReadWriteRequestCallback    				/* Pointer to Callback Function */
+    ),
+    /* Add Client Characteristic Configuration (CCC) descriptor to database */
+    CS_CHAR_CCC(CS_TX_VALUE_CCC0,                   				/* CCC's ID */
+			app_env_cs.from_air_cccd_value,      	 						/* Pointer to CCC's Data */
+			NULL                                    												/* Pointer to CCC's Callback Function */
+    ),
+    /* Add Characteristic User Description descriptor to database */
+    CS_CHAR_USER_DESC(CS_TX_VALUE_USR_DSCP0,        /* User Description's ID */
+			sizeof(CS_CHAR_TX_NAME) - 1,            						/* User Description's Length */
+			CS_CHAR_TX_NAME,                        								/* Pointer to Description String */
+			NULL                                    												/* Pointer to Callback Function */
+    ),
+
+
+	/* CEM102 battery data to serve */
+    CS_CHAR_UUID_128(CS_VBAT_CEM102_VALUE_CHAR0,
+                     CS_VBAT_CEM102_VALUE_VAL0,
+                     CS_CHAR_BAT_CEM102_UUID,
+                     PERM(RD, ENABLE) | PERM(NTF, ENABLE),
+                     sizeof(app_env_cs.vbat_to_air_buffer),
+                     app_env_cs.vbat_to_air_buffer, NULL),
+    CS_CHAR_CCC(CS_VBAT_CEM102_VALUE_CCC0,
+                app_env_cs.vbat_to_air_cccd_value,
+                NULL),
+    CS_CHAR_USER_DESC(CS_VBAT_CEM102_VALUE_USR_DSCP0,
+                      sizeof(CS_VBAT_CEM102_CHAR_NAME) - 1,
+                      CS_VBAT_CEM102_CHAR_NAME,
+                      NULL),
+
+    /* WE1 data to serve */
+    CS_CHAR_UUID_128(CS_WE1_VALUE_CHAR0,
+                     CS_WE1_VALUE_VAL0,
+                     CS_CHAR_WE1_UUID,
+                     PERM(RD, ENABLE) | PERM(NTF, ENABLE),
+                     sizeof(app_env_cs.we1_to_air_buffer),
+                     app_env_cs.we1_to_air_buffer, NULL),
+    CS_CHAR_CCC(CS_WE1_VALUE_CCC0,
+                app_env_cs.we1_to_air_cccd_value,
+                NULL),
+    CS_CHAR_USER_DESC(CS_WE1_VALUE_USR_DSCP0,
+                      sizeof(CS_WE1_CHAR_NAME) - 1,
+                      CS_WE1_CHAR_NAME,
+                      NULL),
+
+    /* WE2 data to serve */
+    CS_CHAR_UUID_128(CS_WE2_VALUE_CHAR0, CS_WE2_VALUE_VAL0, CS_CHAR_WE2_UUID,
+                     PERM(RD, ENABLE) | PERM(NTF, ENABLE),
+                     sizeof(app_env_cs.we2_to_air_buffer),
+                     app_env_cs.we2_to_air_buffer, NULL),
+    CS_CHAR_CCC(CS_WE2_VALUE_CCC0, app_env_cs.we2_to_air_cccd_value, NULL),
+    CS_CHAR_USER_DESC(CS_WE2_VALUE_USR_DSCP0,
+                      sizeof(CS_WE2_CHAR_NAME) - 1, CS_WE2_CHAR_NAME, NULL),
+};
+
+static uint32_t notifyOnTimeout;
+
+const struct att_db_desc * CUSTOMSS_GetDatabaseDescription(uint8_t att_db_cs_svc_id)
+{
+    switch (att_db_cs_svc_id)
+    {
+        case 0:
+        {
+            return att_db_cs_svc0;
+        }
+
+        default:
+            return NULL;
+    }
+}
+
+void CUSTOMSS_Initialize(void)
+{
+    memset(&app_env_cs, '\0', sizeof(struct app_env_tag_cs));
+
+    app_env_cs.to_air_cccd_value[0] = ATT_CCC_START_NTF;          /* RX */
+    app_env_cs.to_air_cccd_value[1] = 0x00;
+
+    notifyOnTimeout = 0;
+
+    MsgHandler_Add(GATTM_ADD_SVC_RSP, CUSTOMSS_MsgHandler);
+    MsgHandler_Add(CUSTOMSS_NTF_TIMEOUT, CUSTOMSS_MsgHandler);
+    MsgHandler_Add(GATTC_CMP_EVT, CUSTOMSS_MsgHandler);
+
+//---------------------------------------------------------------------------------------------
+//	ADD to CUSTOMSS_MsgHandler
+//---------------------------------------------------------------------------------------------
+	MsgHandler_Add(APP_CUSS_AGMS_REQ_DATE_TIME, CUSTOMSS_MsgHandler);
+	MsgHandler_Add(APP_CUSS_AGMS_AFE_UPDATE, CUSTOMSS_MsgHandler);
+	MsgHandler_Add(APP_CUSS_AGMS_NEXT_SEND_DATA, CUSTOMSS_MsgHandler);
+	MsgHandler_Add(APP_CUSS_AGMS_REQ_BASIC_INFO, CUSTOMSS_MsgHandler);
+
+}
+
+void CUSTOMSS_Notify_CEM102Bat_Now(void)
+{
+    /* Change the current notification timer to expire 1 ms later */
+    ke_timer_set(CUSTOMSS_NTF_TIMEOUT, KE_BUILD_ID(TASK_APP, conidx_saved), 1);
+}
+
+
+void CUSTOMSS_Notify_CEM102_Update(void)
+{
+    /* Change the current notification timer to expire 1 ms later */
+    ke_timer_set(APP_CUSS_AGMS_AFE_UPDATE, KE_BUILD_ID(TASK_APP, conidx_saved), 1);
+}
+
+
+void CUSTOMSS_NotifyOnTimeout(uint32_t timeout)
+{
+    notifyOnTimeout = timeout;
+
+    for (uint8_t i = 0; i < BLE_CONNECTION_MAX; i++)
+    {
+        if (GATT_GetEnv()->cust_svc_db[0].cust_svc_start_hdl && timeout)
+        {
+            ke_timer_set(CUSTOMSS_NTF_TIMEOUT, KE_BUILD_ID(TASK_APP, i),
+                         timeout);
+        }
+    }
+}
+
+void CUSTOMSS_MsgHandler(ke_msg_id_t const msg_id, void const *param,
+                         ke_task_id_t const dest_id, ke_task_id_t const src_id)
+{
+	static uint8_t conidx;
+
+    switch (msg_id)
+    {
+        case GATTM_ADD_SVC_RSP:
+        {
+            const struct gattm_add_svc_rsp *p = param;
+            /* If service has been added successfully, start periodic notification timer */
+            if (p->status == ATT_ERR_NO_ERROR && notifyOnTimeout)
+            {
+                for (unsigned int i = 0; i < BLE_CONNECTION_MAX; i++)
+                {
+                    ke_timer_set(CUSTOMSS_NTF_TIMEOUT, KE_BUILD_ID(TASK_APP, i),
+                                 notifyOnTimeout);
+                }
+            }
+        }
+        break;
+
+        case CUSTOMSS_NTF_TIMEOUT:
+            conidx = KE_IDX_GET(dest_id);
+
+            if (conidx_saved != conidx)            {
+                conidx_saved = conidx;
+            }
+#if 0
+            if(progress_time_condition(agme_update_time, 2)) {								// duplication..minimum 2 second
+				agme_update_time = Sys_RTC_Value_Seconds();
+
+				if(rsl15_info->date_time_update==DATE_TIME_UPDATE_SUCCESS) {
+					LSAD_measure_sensor_level();																// read to battery & temperature...rtc time sync
+					append_lsad_lvl_payload();																		// add_Queue Buffer
+				}
+
+				/* Check if the peer device is connected and can be notified */
+				if ((app_env_cs.to_air_cccd_value[0] == ATT_CCC_START_NTF
+					&& app_env_cs.to_air_cccd_value[1] == 0x00)
+					&& GAPC_IsConnectionActive(conidx))
+				{
+					if(rsl15_info->date_time_update==DATE_TIME_UPDATE_SUCCESS) {
+						send_payload_packet(conidx);
+					}
+				}
+			}
+#endif
+            if (notifyOnTimeout)  {  																						/* Restart timer */
+                ke_timer_set(CUSTOMSS_NTF_TIMEOUT,
+                			KE_BUILD_ID(TASK_APP, conidx),
+							notifyOnTimeout);
+            }
+        break;
+
+
+/**************************************************************************************************************
+ * BELOW TO UXN...
+ **************************************************************************************************************/
+        case APP_CUSS_AGMS_AFE_UPDATE:
+
+//#ifdef SWMTRACE_DEBUG
+#if 1
+				swmLogInfo("APP_CUSS_AGMS_AFE_UPDATE!!\r\n");
+#endif
+
+			if(rsl15_info->date_time_update==DATE_TIME_UPDATE_SUCCESS) {
+				LSAD_measure_sensor_level();																// read to battery & temperature...rtc time sync
+				append_lsad_lvl_payload();																		// add_Queue Buffer
+			}
+
+			/* Check if the peer device is connected and can be notified */
+			if ((app_env_cs.to_air_cccd_value[0] == ATT_CCC_START_NTF
+				&& app_env_cs.to_air_cccd_value[1] == 0x00)
+				&& GAPC_IsConnectionActive(conidx))
+			{
+				if(rsl15_info->date_time_update==DATE_TIME_UPDATE_SUCCESS) {
+					send_payload_packet(conidx);
+				}
+			}
+
+        	break;
+
+		case APP_CUSS_AGMS_REQ_DATE_TIME:
+			/* Retrieve the index of the connected peer to notify */
+			conidx = KE_IDX_GET(dest_id);
+
+			/* Check if the peer device is connected and can be notified */
+			if ((app_env_cs.to_air_cccd_value[0] == ATT_CCC_START_NTF
+				&& app_env_cs.to_air_cccd_value[1] == 0x00)
+				&& GAPC_IsConnectionActive(conidx))
+			{
+				if(rsl15_info->date_time_update!=DATE_TIME_UPDATE_SUCCESS) {										// RTC Time Initial
+					get_current_data_time_cmd(conidx, BASE_INFO_INIT);															// request
+					ke_timer_set(
+							APP_CUSS_AGMS_REQ_DATE_TIME,
+							KE_BUILD_ID(TASK_APP, conidx),
+							TIMER_SETTING_S(3)
+						);																																							// 3sec interval
+
+#ifdef SWMTRACE_OUTPUT
+					swmLogInfo("REQUEST_DATE_TIME_UPDATE!!\r\n");
+#endif
+				}
+			}
+			break;
+
+		case APP_CUSS_AGMS_NEXT_SEND_DATA:
+			/* Retrieve the index of the connected peer to notify */
+			conidx = KE_IDX_GET(dest_id);
+
+			/* Check if the peer device is connected and can be notified */
+			if ((app_env_cs.to_air_cccd_value[0] == ATT_CCC_START_NTF
+				&& app_env_cs.to_air_cccd_value[1] == 0x00)
+				&& GAPC_IsConnectionActive(conidx))
+			{
+				send_payload_packet(conidx);
+			}
+			break;
+
+		case APP_CUSS_AGMS_REQ_BASIC_INFO:
+			/* Retrieve the index of the connected peer to notify */
+			conidx = KE_IDX_GET(dest_id);
+
+			/* Check if the peer device is connected and can be notified */
+			if ((app_env_cs.to_air_cccd_value[0] == ATT_CCC_START_NTF
+				&& app_env_cs.to_air_cccd_value[1] == 0x00)
+				&& GAPC_IsConnectionActive(conidx))
+			{
+#ifdef SWMTRACE_OUTPUT
+				swmLogInfo("REQUEST_BASIC INFO!!\r\n");
+#endif
+
+				if(get_agms_base_info()==BASE_INFO_RESPONSE)
+					get_current_data_time_cmd(conidx, BASE_INFO_RESPONSE);
+				else
+					get_current_data_time_cmd(conidx, BASE_INFO_RECONNECT);
+			}
+			break;
+
+			default:
+				break;
+
+    }
+}
+
+/* ----------------------------------------------------------------------------
+ * Public Function Definitions
+ * ------------------------------------------------------------------------- */
+uint8_t App_BLE_CUSSReadWriteRequestCallback(uint8_t conidx, uint16_t attidx,
+    uint16_t handle, uint8_t *dest_buffer, const uint8_t *src_buffer,
+    uint16_t length, uint16_t operation, uint8_t hl_status,
+    uint8_t *cfm_msg_instr)
+{
+
+	/* Initialize a variable to hold the return value */
+    uint8_t status = hl_status;
+
+    /* Instruct the abstraction layer to send a confirmation message */
+    *cfm_msg_instr = CFM_MSG_INSTR_TO_SEND;
+
+    /* Check that there are no high-layer errors */
+    if (hl_status == GAP_ERR_NO_ERROR)
+    {
+        /* Copy the data into the destination buffer */
+        memcpy(dest_buffer, src_buffer, length);
+
+        /* Process the attribute that this read/write callback relates to */
+        switch (attidx)
+        {
+            /* Read or write request to TX characteristic */
+            case CS_TX_VALUE_VAL0:
+            {
+                /* Log the received data */
+#ifdef SWMTRACE_OUTPUT
+                swmLogInfo("TX R/W Callback (%d):(%d) ", conidx, length);
+#endif
+                break;
+            }
+
+            case CS_RX_VALUE_VAL0:
+            {
+                /* Log the received data */
+#ifdef SWMTRACE_OUTPUT
+                swmLogInfo("RX R/W Callback (%d):(%d) ", conidx, length);
+#endif
+            	progress_receive_msg_event(conidx, dest_buffer);
+
+                break;
+            }
+
+
+        }
+
+        /* Update the return status */
+        status = ATT_ERR_NO_ERROR;
+    }
+    else
+    {
+        /* Log the error code */
+#ifdef SWMTRACE_OUTPUT
+        swmLogInfo(
+            "R/W Request Callback (%d); attribute (%d); operation (%d); error (%d)\r\n",
+            conidx, attidx, operation, hl_status
+        );
+#endif
+    }
+
+    return status;
+}
+
+
+void set_agms_base_info(uint8_t base_info)
+{
+	agms_base_info = base_info;
+}
+
+uint8_t get_agms_base_info(void)
+{
+	return agms_base_info;
+}
+
+void set_agms_conidx(uint8_t conidx)
+{
+	conidx_saved = conidx;
+}
+
+uint8_t get_agms_conidx(void)
+{
+	return conidx_saved;
+}
+
+
